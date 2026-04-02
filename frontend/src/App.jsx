@@ -11,6 +11,12 @@ import {
 } from "recharts";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8010";
+const DEFAULT_MODEL_API_URL =
+  import.meta.env.VITE_DEFAULT_MODEL_API_URL ||
+  "https://generativelanguage.googleapis.com/v1beta";
+const DEFAULT_MODEL_API_MODEL =
+  import.meta.env.VITE_DEFAULT_MODEL_API_MODEL ||
+  "gemini-2.5-flash-image";
 
 function MetricCard({ title, value }) {
   return (
@@ -33,9 +39,13 @@ function ImagePanel({ title, base64 }) {
 export default function App() {
   const [selectedFile, setSelectedFile] = useState(null);
   const [imageId, setImageId] = useState("");
-  const [mode, setMode] = useState("fixed");
+  const [mode, setMode] = useState("api");
   const [iterations, setIterations] = useState(10);
   const [adversarial, setAdversarial] = useState(false);
+  const [apiUrl, setApiUrl] = useState(DEFAULT_MODEL_API_URL);
+  const [apiKey, setApiKey] = useState("");
+  const [apiModel, setApiModel] = useState(DEFAULT_MODEL_API_MODEL);
+  const [apiPrompt, setApiPrompt] = useState("Upscale image with clean detail and minimal artifacts.");
   const [result, setResult] = useState(null);
   const [status, setStatus] = useState("Upload an image and run the harness.");
   const [busy, setBusy] = useState(false);
@@ -49,8 +59,8 @@ export default function App() {
       psnr: Number(h.metrics.psnr.toFixed(3)),
       mse: Number(h.metrics.mse.toFixed(3)),
       ssim: Number(h.metrics.ssim.toFixed(4)),
-      sharpening: Number(h.params.sharpening_strength.toFixed(3)),
-      edge: Number(h.params.edge_strength.toFixed(3)),
+      sharpening: Number((h.params?.sharpening_strength ?? 0).toFixed(3)),
+      edge: Number((h.params?.edge_strength ?? 0).toFixed(3)),
     }));
   }, [result]);
 
@@ -80,15 +90,36 @@ export default function App() {
     setBusy(true);
     try {
       const effectiveImageId = existingImageId || (await uploadImage());
-      const endpoint = forcedMode === "fixed" ? "/run-fixed-harness" : "/run-meta-harness";
+      let endpoint = "/run-fixed-harness";
+      if (forcedMode === "meta") {
+        endpoint = "/run-meta-harness";
+      }
+      if (forcedMode === "api") {
+        endpoint = "/run-api-meta-harness";
+      }
 
       const payload = {
         image_id: effectiveImageId,
         adversarial,
       };
 
-      if (forcedMode === "meta") {
+      if (forcedMode === "meta" || forcedMode === "api") {
         payload.iterations = iterations;
+      }
+
+      if (forcedMode === "api") {
+        if (apiUrl.trim()) {
+          payload.api_url = apiUrl.trim();
+        }
+        if (apiKey.trim()) {
+          payload.api_key = apiKey.trim();
+        }
+        if (apiModel.trim()) {
+          payload.model = apiModel.trim();
+        }
+        if (apiPrompt.trim()) {
+          payload.prompt = apiPrompt.trim();
+        }
       }
 
       const res = await fetch(`${API_BASE}${endpoint}`, {
@@ -174,6 +205,12 @@ export default function App() {
             >
               Meta-Harness (Evolving)
             </button>
+            <button
+              className={mode === "api" ? "active" : ""}
+              onClick={() => setMode("api")}
+            >
+              Model-API Harness (Evolving)
+            </button>
           </div>
         </div>
 
@@ -184,7 +221,7 @@ export default function App() {
             min={2}
             max={25}
             value={iterations}
-            disabled={mode !== "meta"}
+            disabled={mode === "fixed"}
             onChange={(e) => setIterations(Number(e.target.value))}
           />
           <strong>{iterations}</strong>
@@ -199,6 +236,44 @@ export default function App() {
           <span>Enable adversarial inputs (noise + patterns + text)</span>
         </label>
       </section>
+
+      {mode === "api" && (
+        <section className="control-grid api-grid">
+          <label className="control card">
+            <span>Model API URL</span>
+            <input
+              type="text"
+              placeholder="https://your-image-api.example/v1/upscale"
+              value={apiUrl}
+              onChange={(e) => setApiUrl(e.target.value)}
+            />
+          </label>
+          <label className="control card">
+            <span>Model Name</span>
+            <input
+              type="text"
+              value={apiModel}
+              onChange={(e) => setApiModel(e.target.value)}
+            />
+          </label>
+          <label className="control card">
+            <span>API Key (optional)</span>
+            <input
+              type="password"
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+            />
+          </label>
+          <label className="control card">
+            <span>Prompt</span>
+            <input
+              type="text"
+              value={apiPrompt}
+              onChange={(e) => setApiPrompt(e.target.value)}
+            />
+          </label>
+        </section>
+      )}
 
       <div className="actions">
         <button disabled={busy || !selectedFile} onClick={handleRunClick}>
@@ -233,9 +308,9 @@ export default function App() {
             <ImagePanel title="Error Heatmap" base64={result.images?.error_heatmap} />
           </section>
 
-          {mode === "meta" && chartData.length > 0 && (
+          {(mode === "meta" || mode === "api") && chartData.length > 0 && (
             <section className="chart-card">
-              <h3>Meta-Harness Iteration History</h3>
+              <h3>{mode === "api" ? "Model-API Harness Iteration History" : "Meta-Harness Iteration History"}</h3>
               <p>
                 The graph below proves recursive adaptation: parameters evolve from prior evaluation results,
                 and quality metrics are recomputed each iteration.

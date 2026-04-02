@@ -95,6 +95,19 @@ h1 {
   font-size: 0.95rem;
 }
 
+.control input[type="text"],
+.control input[type="password"] {
+  border: 1px solid var(--border);
+  background: rgba(10, 32, 36, 0.75);
+  color: var(--text);
+  border-radius: 10px;
+  padding: 0.55rem 0.65rem;
+}
+
+.api-grid {
+  margin-top: 0.8rem;
+}
+
 .toggle-row {
   display: flex;
   gap: 0.45rem;

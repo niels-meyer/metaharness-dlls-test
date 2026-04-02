@@ -1,11 +1,21 @@
 import base64
+from collections import OrderedDict
+import json
+import os
+import urllib.parse
+import urllib.error
+import urllib.request
 import uuid
 from dataclasses import asdict, dataclass
 from io import BytesIO
 from typing import Dict, List, Tuple
 
 import numpy as np
+from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFilter
+
+
+load_dotenv()
 
 
 @dataclass
@@ -19,18 +29,32 @@ class HarnessParams:
 
 
 class ImageStore:
-    def __init__(self) -> None:
-        self._store: Dict[str, np.ndarray] = {}
+    def __init__(self, max_images: int = 80) -> None:
+        self._store: "OrderedDict[str, np.ndarray]" = OrderedDict()
+        self.max_images = max(10, int(max_images))
+
+    def _evict_if_needed(self) -> None:
+        while len(self._store) > self.max_images:
+            self._store.popitem(last=False)
 
     def put(self, image: np.ndarray) -> str:
         image_id = str(uuid.uuid4())
         self._store[image_id] = image
+        self._store.move_to_end(image_id)
+        self._evict_if_needed()
         return image_id
 
     def get(self, image_id: str) -> np.ndarray:
         if image_id not in self._store:
             raise KeyError(f"image_id not found: {image_id}")
+        self._store.move_to_end(image_id)
         return self._store[image_id]
+
+    def stats(self) -> Dict[str, int]:
+        return {
+            "count": len(self._store),
+            "max_images": self.max_images,
+        }
 
 
 FIXED_PARAMS = HarnessParams(sharpening_strength=0.55, edge_strength=0.1, detail_boost=0.9)
@@ -364,5 +388,248 @@ def run_meta_harness_pipeline(gt_image: np.ndarray, iterations: int, adversarial
         "metrics": {
             "baseline": baseline_metrics,
             "enhanced": best_metrics if best_metrics else baseline_metrics,
+        },
+    }
+
+
+def _call_model_api(
+    source_image: np.ndarray,
+    target_shape: Tuple[int, int],
+    prompt: str,
+    iteration: int,
+    previous_output: np.ndarray | None,
+    api_url: str,
+    api_key: str,
+    model: str,
+) -> np.ndarray:
+    def _is_google_url(url: str) -> bool:
+        return "generativelanguage.googleapis.com" in url
+
+    def _extract_google_image_base64(resp_data: Dict) -> str:
+        candidates = resp_data.get("candidates", [])
+        for candidate in candidates:
+            content = candidate.get("content", {})
+            parts = content.get("parts", [])
+            for part in parts:
+                inline = part.get("inlineData") or part.get("inline_data")
+                if inline and inline.get("data"):
+                    return inline["data"]
+        raise ValueError("Google response did not contain generated image data")
+
+    if _is_google_url(api_url):
+        base_url = api_url.rstrip("/")
+        safe_model = model.removeprefix("models/")
+        if ":generateContent" not in base_url:
+            if "/models/" in base_url:
+                base_url = f"{base_url}:generateContent"
+            else:
+                base_url = f"{base_url}/models/{safe_model}:generateContent"
+
+        if not api_key:
+            raise ValueError("Google API key missing. Provide api_key or set MODEL_API_KEY.")
+
+        separator = "&" if "?" in base_url else "?"
+        request_url = f"{base_url}{separator}key={urllib.parse.quote(api_key)}"
+
+        parts = [
+            {"text": f"{prompt} Target size: {target_shape[1]}x{target_shape[0]}."},
+            {
+                "inlineData": {
+                    "mimeType": "image/png",
+                    "data": encode_png_base64(source_image),
+                }
+            },
+        ]
+        if previous_output is not None:
+            parts.append(
+                {
+                    "inlineData": {
+                        "mimeType": "image/png",
+                        "data": encode_png_base64(previous_output),
+                    }
+                }
+            )
+
+        body = json.dumps(
+            {
+                "contents": [{"role": "user", "parts": parts}],
+                "generationConfig": {
+                    "responseModalities": ["TEXT", "IMAGE"],
+                },
+            }
+        ).encode("utf-8")
+
+        headers = {
+            "Content-Type": "application/json",
+        }
+
+        req = urllib.request.Request(url=request_url, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=90) as resp:  # nosec B310 - user-provided API endpoint is intentional.
+                raw = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else str(exc)
+            raise ValueError(f"Google API error {exc.code}: {detail}") from exc
+
+        data = json.loads(raw)
+        out_bytes = base64.b64decode(_extract_google_image_base64(data))
+        out = decode_image_bytes(out_bytes)
+        if out.shape[:2] != target_shape:
+            out = upscale_bicubic(out, target_shape)
+        return out
+
+    payload = {
+        "image_base64": encode_png_base64(source_image),
+        "target_width": int(target_shape[1]),
+        "target_height": int(target_shape[0]),
+        "prompt": prompt,
+        "model": model,
+        "iteration": iteration,
+    }
+    if previous_output is not None:
+        payload["previous_output_base64"] = encode_png_base64(previous_output)
+
+    body = json.dumps(payload).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    req = urllib.request.Request(url=api_url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:  # nosec B310 - user-provided API endpoint is intentional.
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else str(exc)
+        raise ValueError(f"Model API error {exc.code}: {detail}") from exc
+
+    data = json.loads(raw)
+    if "image_base64" not in data:
+        raise ValueError("Model API response must contain 'image_base64'")
+
+    out_bytes = base64.b64decode(data["image_base64"])
+    out = decode_image_bytes(out_bytes)
+    if out.shape[:2] != target_shape:
+        out = upscale_bicubic(out, target_shape)
+    return out
+
+
+def run_api_meta_harness_pipeline(
+    gt_image: np.ndarray,
+    iterations: int,
+    adversarial: bool,
+    api_url: str | None,
+    api_key: str | None,
+    model: str | None,
+    prompt: str | None,
+) -> Dict:
+    resolved_url = (
+        api_url
+        or os.getenv("MODEL_API_URL")
+        or "https://generativelanguage.googleapis.com/v1beta"
+    ).strip()
+    resolved_key = (api_key or os.getenv("MODEL_API_KEY") or "").strip()
+    resolved_model = (
+        model
+        or os.getenv("MODEL_API_MODEL")
+        or "gemini-2.5-flash-image"
+    ).strip()
+    base_prompt = (prompt or "Upscale image with clean detail and minimal artifacts.").strip()
+
+    if "generativelanguage.googleapis.com" in resolved_url and resolved_model == "generic-image-upscaler":
+        resolved_model = "gemini-2.5-flash-image"
+
+    if not resolved_url:
+        raise ValueError("Model API URL missing. Provide api_url or set MODEL_API_URL.")
+
+    low_res = downscale_image(gt_image, scaling_factor=2)
+    low_res_eval = apply_adversarial_inputs(low_res) if adversarial else low_res
+    baseline = upscale_bicubic(low_res_eval, gt_image.shape[:2])
+    baseline_metrics = evaluate_with_regions(gt_image, baseline)
+
+    current_params = HarnessParams(sharpening_strength=0.45, edge_strength=0.1, detail_boost=0.9)
+    history: List[Dict] = []
+
+    best_image = None
+    best_metrics = None
+    best_iteration = 0
+    best_psnr = -1e9
+    prev_psnr = None
+    previous_api_output = None
+
+    for i in range(iterations):
+        detail_hint = "preserve fine textures" if i == 0 else (
+            "increase local detail recovery" if history[-1]["metrics"]["detail_error"] > history[-1]["metrics"]["smooth_error"] else "reduce over-sharpening and ringing"
+        )
+        iter_prompt = f"{base_prompt} Priority: {detail_hint}."
+
+        api_image = _call_model_api(
+            source_image=low_res_eval,
+            target_shape=gt_image.shape[:2],
+            prompt=iter_prompt,
+            iteration=i + 1,
+            previous_output=previous_api_output,
+            api_url=resolved_url,
+            api_key=resolved_key,
+            model=resolved_model,
+        )
+
+        # Local post-enhancement keeps the harness adaptation behavior comparable to other modes.
+        enhanced = upscale_enhanced(
+            downscale_image(api_image, scaling_factor=2),
+            gt_image.shape[:2],
+            current_params,
+        )
+        metrics = evaluate_with_regions(gt_image, enhanced)
+
+        history.append(
+            {
+                "iteration": i + 1,
+                "params": {
+                    **current_params.to_dict(),
+                    "model": resolved_model,
+                    "prompt": iter_prompt,
+                },
+                "metrics": metrics,
+            }
+        )
+
+        if metrics["psnr"] > best_psnr:
+            best_psnr = metrics["psnr"]
+            best_image = enhanced
+            best_metrics = metrics
+            best_iteration = i + 1
+
+        current_params = adapt_params(current_params, metrics, prev_psnr)
+        prev_psnr = metrics["psnr"]
+        previous_api_output = api_image
+
+    if best_image is None:
+        best_image = baseline
+
+    heatmap = difference_heatmap(gt_image, best_image)
+
+    return {
+        "mode": "api-meta",
+        "iterations": iterations,
+        "final_parameters": current_params.to_dict(),
+        "best_iteration": best_iteration,
+        "history": history,
+        "images": {
+            "ground_truth": encode_png_base64(gt_image),
+            "low_res": encode_png_base64(low_res_eval),
+            "baseline_upscale": encode_png_base64(baseline),
+            "enhanced_upscale": encode_png_base64(best_image),
+            "error_heatmap": encode_png_base64(heatmap),
+        },
+        "metrics": {
+            "baseline": baseline_metrics,
+            "enhanced": best_metrics if best_metrics else baseline_metrics,
+        },
+        "api": {
+            "url": resolved_url,
+            "model": resolved_model,
+            "prompt": base_prompt,
         },
     }

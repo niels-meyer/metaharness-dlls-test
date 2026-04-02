@@ -1,8 +1,10 @@
+import os
 from typing import Optional
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 
 from .image_ops import (
     FIXED_PARAMS,
@@ -12,6 +14,7 @@ from .image_ops import (
     downscale_image,
     encode_png_base64,
     evaluate_with_regions,
+    run_api_meta_harness_pipeline,
     run_fixed_harness_pipeline,
     run_meta_harness_pipeline,
     upscale_bicubic,
@@ -22,15 +25,42 @@ from .image_ops import (
 
 app = FastAPI(title="DLSS Meta-Harness Experiment API", version="1.0.0")
 
+load_dotenv()
+
+DEFAULT_LOCAL_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+
+cors_origins_env = os.getenv("CORS_ALLOW_ORIGINS", "")
+if cors_origins_env.strip():
+    allowed_origins = [o.strip() for o in cors_origins_env.split(",") if o.strip()]
+else:
+    allowed_origins = DEFAULT_LOCAL_ORIGINS
+
+allow_localhost_regex = os.getenv("CORS_ALLOW_LOCALHOST_REGEX", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+max_upload_bytes = int(os.getenv("MAX_UPLOAD_BYTES", str(12 * 1024 * 1024)))
+max_image_pixels = int(os.getenv("MAX_IMAGE_PIXELS", str(12_000_000)))
+max_image_width = int(os.getenv("MAX_IMAGE_WIDTH", "6000"))
+max_image_height = int(os.getenv("MAX_IMAGE_HEIGHT", "6000"))
+max_store_images = int(os.getenv("MAX_STORE_IMAGES", "80"))
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$" if allow_localhost_regex else None,
 )
 
-store = ImageStore()
+store = ImageStore(max_images=max_store_images)
 
 
 class ImageRequest(BaseModel):
@@ -61,6 +91,13 @@ class MetaHarnessRequest(HarnessRequest):
     iterations: int = Field(default=8, ge=2, le=30)
 
 
+class ApiMetaHarnessRequest(MetaHarnessRequest):
+    api_url: Optional[str] = None
+    api_key: Optional[str] = None
+    model: Optional[str] = None
+    prompt: Optional[str] = None
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -69,10 +106,35 @@ def health() -> dict:
 @app.post("/upload")
 async def upload_image(file: UploadFile = File(...)) -> dict:
     content = await file.read()
+    if len(content) > max_upload_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Uploaded file too large ({len(content)} bytes). Max allowed is {max_upload_bytes} bytes.",
+        )
+
     try:
         image = decode_image_bytes(content)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    height, width = image.shape[:2]
+    if width > max_image_width or height > max_image_height:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Image dimensions too large ({width}x{height}). "
+                f"Max allowed is {max_image_width}x{max_image_height}."
+            ),
+        )
+
+    if width * height > max_image_pixels:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Image has too many pixels ({width * height}). "
+                f"Max allowed is {max_image_pixels}."
+            ),
+        )
 
     image_id = store.put(image)
     return {
@@ -178,6 +240,36 @@ def run_meta_harness(req: MetaHarnessRequest) -> dict:
     return result
 
 
+@app.post("/run-api-meta-harness")
+def run_api_meta_harness(req: ApiMetaHarnessRequest) -> dict:
+    try:
+        gt = store.get(req.image_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    try:
+        result = run_api_meta_harness_pipeline(
+            gt,
+            iterations=req.iterations,
+            adversarial=req.adversarial,
+            api_url=req.api_url,
+            api_key=req.api_key,
+            model=req.model,
+            prompt=req.prompt,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Model API request failed: {exc}") from exc
+
+    return result
+
+
 @app.get("/default-fixed-parameters")
 def default_fixed_parameters() -> dict:
     return FIXED_PARAMS.to_dict()
+
+
+@app.get("/store-stats")
+def store_stats() -> dict:
+    return store.stats()
